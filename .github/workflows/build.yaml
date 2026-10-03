@@ -1,0 +1,89 @@
+name: Build and push bare-metal bootc derivative
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 19 * * 6'
+  push:
+    branches:
+      - "main"
+      - "test"
+      - "stage"
+      - "next"
+      - "poc"
+
+jobs:
+  build:
+    if: contains(fromJson('["main","test","stage","next","poc"]'), github.ref_name)
+    runs-on: ${{ matrix.target_arch == 'aarch64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        release_version:
+          - "44"
+        target_arch:
+          - "x86_64"
+          - "aarch64"
+        backend:
+          - "composefs"
+          - "ostree"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure AppArmor for Podman builds
+        run: |
+          echo -n "AppArmor status before teardown: "
+          sudo aa-status
+          echo "AppArmor kernel messages before teardown:"
+          sudo journalctl -k --no-pager | grep -Ei 'apparmor|audit.*denied' || true
+          echo "Disabling AppArmor's unprivileged user namespace restrictions"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined ]]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+          fi
+          sudo systemctl mask --runtime apparmor.service
+          sudo aa-teardown
+          echo -n "AppArmor status after teardown: "
+          sudo aa-status || true
+          echo -n "Current shell confinement: "
+          cat /proc/self/attr/current
+      - name: Login to registry
+        env:
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${REGISTRY_PASSWORD}" | podman login --username "${{ github.actor }}" --password-stdin ghcr.io
+      - name: Build and push bare-metal derivative
+        run: |
+          branch_tag=$(printf '%s' "${{ github.ref_name }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's#[^a-z0-9_.-]+#-#g; s#^[.-]+##; s#[.-]+$##' \
+              | cut -c1-100)
+          ./build.sh \
+              -a "${{ matrix.target_arch }}" \
+              -b "${{ matrix.backend }}" \
+              -c Containerfile.bare-metal \
+              -d ghcr.io \
+              -r "${{ matrix.release_version }}" \
+              -n "${GITHUB_REPOSITORY,,}" \
+              -s "${branch_tag}-${{ matrix.backend }}-${{ matrix.target_arch }}" \
+              -s "${{ github.sha }}-${{ matrix.backend }}-${{ matrix.target_arch }}" \
+              -- --security-opt=apparmor=unconfined \
+              --build-arg base_tag="${branch_tag}"
+      - name: Collect security diagnostics
+        if: always()
+        run: |
+          echo -n "uname: "
+          uname -a
+          echo "Podman version: "
+          podman version || true
+          podman info --debug || true
+          echo -n "Current shell confinement: "
+          cat /proc/self/attr/current || true
+          echo -n "AppArmor status: "
+          sudo aa-status || true
+          echo "AppArmor sysctls"
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sysctl kernel.apparmor_restrict_unprivileged_unconfined || true
+          echo "AppArmor and access-denial kernel messages:"
+          sudo journalctl -k --no-pager | grep -Ei 'apparmor|audit.*denied|permission denied' || true

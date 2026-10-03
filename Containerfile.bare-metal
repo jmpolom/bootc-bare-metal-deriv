@@ -1,0 +1,43 @@
+ARG release=44
+ARG backend=composefs
+ARG arch=x86_64
+ARG base_image=ghcr.io/jmpolom/bootc-composefs-base
+ARG base_tag=main
+ARG tag=${release}-${base_tag}-${backend}-${arch}
+
+FROM ${base_image}:${tag}
+
+COPY bare-metal-default.env /usr/libexec/bootc-installer/bare-metal-default.env
+
+# Keep every package explicit, including packages currently present in the base.
+RUN dnf install -y --setopt=install_weak_deps=false \
+    knot-resolver \
+    systemd-networkd \
+    nftables \
+    chrony \
+    dhcpcd \
+    radvd \
+    kea \
+    openssh-clients \
+    openssh-server \
+    procps-ng \
+    vim-minimal \
+    audit \
+    policycoreutils && \
+    dnf clean all
+
+# Remove generated package-manager state and transient scriptlet files.
+# Preserve build-time mount points, as in the upstream base Containerfiles.
+RUN set -e -o pipefail; \
+    rm -rf /var/cache/dnf /var/cache/libdnf5 /var/cache/ldconfig \
+      /var/lib/dnf /var/log/dnf5.log; \
+    find /run /tmp -mindepth 1 \
+      -exec sh -c 'findmnt -rn -M "$1" >/dev/null' sh {} \; -prune -o \
+      \( -type f -o -type l \) -exec rm -f -- {} +; \
+    find /run /tmp -mindepth 1 \
+      -exec sh -c 'findmnt -rn -M "$1" >/dev/null' sh {} \; -prune -o \
+      -type d -print0 | sort -zr | \
+      xargs -0 -r rmdir --ignore-fail-on-non-empty --
+
+# The base's absolute /usr/local symlink cannot be traversed by runtime-deps lint.
+RUN PATH=/usr/bin bootc container lint --no-truncate
